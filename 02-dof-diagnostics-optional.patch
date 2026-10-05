@@ -1,0 +1,118 @@
+--- a/src/gles/gl.cpp
++++ b/src/gles/gl.cpp
+@@ -8,6 +8,7 @@
+ #include <miniz/miniz.h>
+ #include <atomic>
+ #include <cctype>
++#include <cstdio>
+ #include <cstring>
+ #include <filesystem>
+ #include <fstream>
+@@ -99,6 +100,9 @@
+     X(glGetError, GLenum, (), ())                                                                                    \
+     X(glGetIntegerv, void, (GLenum a, GLint* b), (a, b))                                                             \
+     X(glGetProgramiv, void, (GLuint a, GLenum b, GLint* c), (a, b, c))                                               \
++    X(glGetActiveUniform, void, (GLuint a, GLuint b, GLsizei c, GLsizei* d, GLint* e, GLenum* f, char* g), (a, b, c, d, e, f, g)) \
++    X(glGetUniformfv, void, (GLuint a, GLint b, GLfloat* c), (a, b, c))                                              \
++    X(glGetTexLevelParameteriv, void, (GLenum a, GLint b, GLenum c, GLint* d), (a, b, c, d))                         \
+     X(glGetQueryObjectuiv, void, (GLuint a, GLenum b, GLuint* c), (a, b, c))                                         \
+     X(glGetQueryObjectuivEXT, void, (GLuint a, GLenum b, GLuint* c), (a, b, c))                                      \
+     X(glGetRenderbufferParameteriv, void, (GLenum a, GLenum b, GLint* c), (a, b, c))                                 \
+@@ -257,6 +261,7 @@
+ // debug.ibport.framelog N (a new N each time): logs every viewport, framebuffer, texture filter and draw of
+ // one frame, with the textures bound to units 0-3 (for render-pass bugs).
+ std::atomic<int> g_framelog{0};
++std::atomic<bool> g_dofwatch{false}, g_pp_only{false};  // debug.ibport.dofwatch 1: log only the post-process draws, every ~2 s
+ std::string bound_textures() {
+     std::string s;
+     GLint active = 0;
+@@ -268,7 +273,13 @@
+         if (!t) continue;
+         p_glGetTexParameteriv(GL_TEXTURE_2D, 0x2801, &mn);
+         p_glGetTexParameteriv(GL_TEXTURE_2D, 0x2800, &mg);
+-        s += " u" + std::to_string(u) + "=tex" + std::to_string(t) + "(min " + std::to_string(mn) + " mag " + std::to_string(mg) + ")";
++        GLint tw = 0, th = 0;
++        if (p_glGetTexLevelParameteriv) {
++            p_glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1000 /*WIDTH*/, &tw);
++            p_glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, 0x1001 /*HEIGHT*/, &th);
++        }
++        s += " u" + std::to_string(u) + "=tex" + std::to_string(t) + "(" + std::to_string(tw) + "x" + std::to_string(th) + " min " +
++             std::to_string(mn) + " mag " + std::to_string(mg) + ")";
+     }
+     p_glActiveTexture(active);
+     return s;
+@@ -291,10 +302,40 @@
+                                 "SourceTextureScaleBias", "SceneColorScaleBias", "HalfResMaskRect", "TexCenter", "TextureTransform"})
+             if (std::strstr(src, tag) && tags.find(tag) == std::string::npos) tags += std::string(" ") + tag;
+     }
++    if (g_pp_only && tags.empty()) return;
+     std::string ids;
+     for (GLsizei i = 0; i < n; i++) ids += " " + std::to_string(shaders[i]);
+     LOG_INFO("framelog: %s %d fb %d prog %d (shaders%s) viewport %d,%d %dx%d%s |%s", what, count, fb, prog, ids.c_str(), vp[0], vp[1],
+              vp[2], vp[3], bound_textures().c_str(), tags.c_str());
++    if (!prog || tags.empty() || !p_glGetActiveUniform || !p_glGetUniformfv) return;
++    GLint nu = 0;
++    p_glGetProgramiv(prog, 0x8B86 /*ACTIVE_UNIFORMS*/, &nu);
++    for (GLint i = 0; i < nu; i++) {
++        char name[96] = "";
++        GLsizei len = 0;
++        GLint size = 0;
++        GLenum type = 0;
++        p_glGetActiveUniform(prog, (GLuint)i, sizeof name, &len, &size, &type, name);
++        std::string base = name;
++        if (base.size() > 3 && base.compare(base.size() - 3, 3, "[0]") == 0) base.resize(base.size() - 3);
++        bool want = false;
++        for (const char* k : {"SampleWeights", "SampleOffsets", "DOFPacked", "MinZ_MaxZ", "BloomScale", "SourceTextureScaleBias",
++                              "SceneColorScaleBias", "SampleMaskRect", "HalfResMaskRect", "DOFFactor", "SceneColorRect"})
++            if (base.find(k) != std::string::npos) want = true;
++        if (!want) continue;
++        std::string line;
++        for (GLint k = 0; k < size && k < 16; k++) {
++            std::string n = size > 1 ? base + "[" + std::to_string(k) + "]" : base;
++            GLint loc = p_glGetUniformLocation(prog, n.c_str());
++            if (loc < 0) continue;
++            GLfloat v[4] = {};
++            p_glGetUniformfv(prog, loc, v);
++            char buf[160];
++            std::snprintf(buf, sizeof buf, " %s=(%.6g %.6g %.6g %.6g)", n.c_str(), v[0], v[1], v[2], v[3]);
++            line += buf;
++        }
++        LOG_INFO("framelog-u: prog %d%s", prog, line.c_str());
++    }
+ }
+ 
+ // Called at every present: starts or ends a logged frame.
+@@ -303,12 +344,23 @@
+     static std::string last = "0";
+     if (g_framelog > 0 && --g_framelog == 0) LOG_INFO("framelog: frame %llu ends", (unsigned long long)frame);
+     if (frame % 30) return;
++    {
++        char w[PROP_VALUE_MAX] = "";
++        __system_property_get("debug.ibport.dofwatch", w);
++        g_dofwatch = w[0] == '1';
++        if (g_dofwatch && g_framelog == 0 && frame % 60 == 0) {
++            g_pp_only = true;
++            g_framelog = 2;
++            LOG_INFO("framelog: watch from frame %llu", (unsigned long long)frame);
++        }
++    }
+     char v[PROP_VALUE_MAX] = "";
+     __system_property_get("debug.ibport.framelog", v);
+     if (last == v) return;
+     bool first = last == "0" && std::string(v) == "0";
+     last = v;
+     if (!first && v[0] && std::string(v) != "0") {
++        g_pp_only = false;
+         g_framelog = 2;  // the rest of this frame, then a whole one
+         LOG_INFO("framelog: from frame %llu", (unsigned long long)frame);
+     }
+@@ -1021,7 +1073,8 @@
+         if (moved != src || fixed != moved) {
+             int r = ++rewritten;
+             if (r <= 10 || r % 50 == 0)
+-                LOG_INFO("shader %d rewritten (%d so far): %s", n, r, moved != src ? "globals moved into main" : shadowed != moved ? "shadow filter" : "blur precision and tap order");
++                LOG_INFO("shader %d rewritten (%d so far): %s", n, r,
++                         moved != src ? "globals moved into main" : shadowed != moved ? "shadow filter" : "blur precision and tap order");
+         }
+ #ifdef __ANDROID__
+         // debug.ibport.dumpshaders 1: every shader as compiled goes to shaderdump/<n>.glsl (for reverse engineering).

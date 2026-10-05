@@ -1,0 +1,172 @@
+INFINITY BLADE III ANDROID PORT (source 1.8) - DEPTH OF FIELD FIX
+=================================================================
+
+SUMMARY
+-------
+The depth-of-field blur on Android looked weaker and streaky compared with iOS/PC.
+Cause: the Gaussian blur vertex shader and the data the engine feeds it disagree about how
+the two taps of each pair are packed. The second tap of every pair was sampled on the wrong
+axis (above/below the pixel in the horizontal pass, left/right in the vertical pass), so the
+"separable Gaussian" became a half-strength cross-shaped kernel with streaks.
+
+Fix: rewrite the blur vertex shader at shader-load time so the offsets are swizzled into the
+order the pixel shader expects. One token added per shader:
+
+    OffsetUVs[OffsetIndex] = TexCoords0.xyyx + SampleOffsets16[OffsetIndex];
+    becomes
+    OffsetUVs[OffsetIndex] = TexCoords0.xyyx + SampleOffsets16[OffsetIndex].xywz;
+
+Tested on a Snapdragon device (Adreno 750, GLES 3.2) in a DOF cutscene: the blur now matches
+the expected look. This is the change that fixed it.
+
+
+FILES IN THIS PACKAGE
+---------------------
+  IB3_DOF_FIX_WRITEUP.txt            this file
+  dof_precision.h                    NEW file, goes in src/gles/
+  gl.cpp                             modified src/gles/gl.cpp, exactly as built (fix + diagnostics)
+  01-dof-fix.patch                   the fix only (new header + 4 lines in gl.cpp)
+  02-dof-diagnostics-optional.patch  optional debug logging, applies on top of 01
+  InfinityBladeIII-Android-1.8-dof-fix.apk   the tested build
+
+Apply to a pristine 1.8 tree from its root:
+    patch -p1 < 01-dof-fix.patch
+    patch -p1 < 02-dof-diagnostics-optional.patch      (optional)
+Both were checked to apply cleanly to the stock 1.8 gl.cpp. No CMake change is needed:
+CMake globs src/, and dof_precision.h is header-only.
+
+
+HOW THE BUG WAS FOUND
+---------------------
+1. Where DOF lives. The port does not implement DOF; it runs the game's own UE3 post-process
+   shaders from the .ipa through the phone's GL driver. The chain per frame is:
+     - 4-tap downsample of the scene to a quarter-resolution buffer (796x362 on a 3168x1440 render,
+       i.e. 3176/4 + 2 border texels)
+     - DOF/bloom gather at quarter res (reads depth, writes BlurFactor in alpha)
+     - two 16-tap Gaussian blur passes (horizontal, then vertical) at quarter res
+     - full-resolution composite (ApplyBloomAndDOF) blending sharp scene and blurred buffer
+   The port only toggles settings; it never touched these shaders.
+
+2. First theory (WRONG, harmless): mediump precision in the DOF chain. Shaders declare
+   "precision mediump float" and "varying mediump" UVs, which Adreno really computes at 16 bits.
+   I forced highp on those. It ran fine but DOF looked identical to stock, so precision was not
+   the cause. See "optional/unproven part" below.
+
+3. Diagnostics. I added logging (02-dof-diagnostics-optional.patch): with debug.ibport.framelog
+   or the new debug.ibport.dofwatch, the existing frame logger now also prints texture sizes and
+   the live uniform values (SampleOffsets, SampleWeights, DOFPackedParameters, MinZ_MaxZRatio...)
+   via glGetActiveUniform/glGetUniformfv. DOF only runs in cutscenes, so dofwatch=1 logs only
+   the post-process draws every ~2 s so a cutscene can be captured without timing.
+
+4. The evidence, from a captured DOF frame (blur pass, horizontal):
+     SampleOffsets16[0] = (-0.0116545, 0, -0.00919494, 0)
+     SampleOffsets16[1] = (-0.00673942, 0, -0.00428709, 0)
+     ...
+   Offsets step by ~1.95 texels in x, so the vec4 is laid out as (xA, yA, xB, yB): sample A at
+   (xA,yA), sample B at (xB,yB). Vertical pass looks the same, e.g.
+     SampleOffsets16[0] = (0, -0.025627, 0, -0.0202187)
+   The weights are a proper Gaussian (11 real taps, sums to 1.0).
+
+   But the dumped blur shaders (debug.ibport.dumpshaders; vertex 283/286/289 in my dump) do:
+     OffsetUVs[i] = TexCoords0.xyyx + SampleOffsetsN[i];      // (u,v,v,u) + (o.x,o.y,o.z,o.w)
+   and the pixel shader reads  UV1 = OffsetUVs.xy ;  UV2 = OffsetUVs.wz.
+   That arrangement is only correct if the offsets were packed (xA, yA, yB, xB). With the actual
+   (xA, yA, xB, yB) data:
+     UV1 = (u + xA, v + yA)                 correct
+     UV2 = (u + yB, v + xB)                 WRONG: x and y offsets swapped
+   Horizontal pass (yB = 0): tap B = (u, v + xB), i.e. vertical.
+   Vertical pass   (xB = 0): tap B = (u + yB, v), i.e. horizontal.
+   So half the taps of each pass blur along the wrong axis.
+
+5. Confirmation by simulation. I ran the real 12-tap kernel and weights from the log over a sharp
+   image with correct taps vs. the swapped taps. The swapped version keeps edge detail and shows
+   ghosting/cross-hatching, matching the Android screenshot; the correct version is much smoother
+   and heavier, matching PC.
+
+6. Fix and test. With o = (xA, yA, xB, yB), using o.xywz gives
+     (u,v,v,u) + (xA, yA, yB, xB) = (u+xA, v+yA, v+yB, u+xB)
+   so the pixel shader's .xy = (u+xA, v+yA) and .wz = (u+xB, v+yB). Both taps land correctly.
+   The pixel shaders are untouched.
+
+
+WHAT EXACTLY CHANGED IN THE SOURCE
+----------------------------------
+A) NEW  src/gles/dof_precision.h  (header-only, namespace gles)
+   - fix_blur_offset_order(src)   THE FIX. If the source contains
+         "TexCoords0.xyyx + SampleOffsets"
+     it appends ".xywz" right after the closing ']' of the SampleOffsets index expression.
+     Matches by text, so it covers every sample-count variant (SampleOffsets16, ...8, etc.).
+     Run against my 373-shader dump it changes exactly 3 vertex shaders (the 16- and 8-tap
+     blur variants) and nothing else. Idempotent.
+   - dof_chain_shader(src) / highp_dof_chain(src)   OPTIONAL, see below.
+
+B) src/gles/gl.cpp
+   1. Add near the other includes:
+          #include "gles/dof_precision.h"
+   2. In the shader-source rewrite hook (the function that already runs
+      smooth_modulated_shadows on the globals-moved source), replace
+          std::string fixed = smooth_modulated_shadows(moved);
+      with
+          std::string shadowed = smooth_modulated_shadows(moved);
+          std::string fixed = fix_blur_offset_order(highp_dof_chain(shadowed));
+      and update the log label for the rewritten-shader message accordingly.
+   That is the whole fix (01-dof-fix.patch).
+
+C) OPTIONAL diagnostics in gl.cpp (02-dof-diagnostics-optional.patch), inert unless the debug
+   properties are set:
+   - glGetActiveUniform / glGetUniformfv / glGetTexLevelParameteriv added to the GL function table
+   - frame log prints bound-texture sizes and "framelog-u:" lines with uniform values for
+     post-process draws
+   - debug.ibport.dofwatch 1: logs only post-process draws about every 60 frames
+
+
+OPTIONAL / UNPROVEN PART
+------------------------
+highp_dof_chain() promotes the "varying mediump" UVs and the default float/sampler2D precision
+to highp in the 16 DOF-chain shaders (19 with the shared gather vertex shader and its fragment
+shaders). It rests on a real difference (the gather pass samples depth through a default-
+precision sampler; the composite uses "highp sampler2D") but the test build with ONLY this
+change looked identical to stock, so it is not what fixed the visuals. It is harmless and was
+included in the tested APK, so 01-dof-fix.patch ships the tested combination. A dev who wants
+the minimal fix can drop highp_dof_chain() and keep only fix_blur_offset_order(); I have not
+built and tested that exact minimal variant.
+
+
+OPEN QUESTION (for the dev)
+---------------------------
+I do not know why the same mismatch does not show on iOS. The engine writes (xA,yA,xB,yB),
+the shader text expects (xA,yA,yB,xB), and the port passes glUniform4fv through unmodified
+(checked in gl.cpp). Possibly the iOS path uses a different shader permutation or a different
+packing branch in the guest engine (iOS devices cap the blur at 4 samples, per the existing
+changelog entry, so the artefact would be much smaller there). Whoever knows the guest
+engine's filter-shader setup could confirm. An equivalent alternative fix is changing the
+vertex shader to "TexCoords0.xyxy + SampleOffsetsN[i]" and the pixel shader's ".wz" to ".zw";
+I chose the single-token vertex swizzle because it touches only 3 shaders and no pixel shader.
+
+Caveat: the swizzle assumes the engine's packing is the same for every blur draw. All blur
+draws seen in the capture (horizontal and vertical, both 16-tap) use the (xA,yA,xB,yB) layout.
+The 8-tap variant was patched the same way but I did not see it drawn in the capture.
+
+
+HOW TO VERIFY ON DEVICE
+-----------------------
+    adb shell setprop debug.ibport.dofwatch 1      (needs the diagnostics patch)
+    ... play a DOF cutscene ...
+    adb logcat -d | findstr framelog
+Look for prog 285 (the blur) with SampleOffsets16 as above. For the visual check, compare the
+blurred background (rock/sky) against the PC/iOS reference: the streaking and cross-hatching
+should be gone and the blur should be smooth and heavier.
+In logcat the load-time rewrite shows as
+    shader N rewritten (...): blur precision and tap order
+(only the first 10 and every 50th rewrite are logged).
+
+
+BUILD NOTES (not part of the fix)
+---------------------------------
+The tested APK was built in a sandbox without Google's download hosts, so it used a community
+NDK sysroot from GitHub (SHA-256 verified), Ubuntu clang 18 for the native code, the older dx
+with a small ASM-based lambda desugarer instead of d8, and an Android 34 stub jar. The Java
+launcher, manifest and native code are otherwise unchanged from 1.8 (the zip had no
+res-ib3 icon resources, so a placeholder icon was used). The signing key is a throwaway debug
+key, so the APK will not update over an install signed with a different key. A normal build
+with the project's own scripts should not need any of this; only the C++ changes above matter.
